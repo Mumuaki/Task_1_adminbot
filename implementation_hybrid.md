@@ -1,0 +1,2231 @@
+# Технический план реализации: Гибридная система мониторинга Telegram
+
+## Оглавление
+1. [Обзор проекта и архитектуры](#1-обзор-проекта-и-архитектуры)
+2. [Детальное описание модулей](#2-детальное-описание-модулей)
+3. [Структуры данных](#3-структуры-данных)
+4. [Взаимодействие компонентов](#4-взаимодействие-компонентов)
+5. [Поэтапный план разработки](#5-поэтапный-план-разработки)
+6. [Тестирование и отладка](#6-тестирование-и-отладка)
+7. [Развертывание и эксплуатация](#7-развертывание-и-эксплуатация)
+
+---
+
+## 1. Обзор проекта и архитектуры
+
+### 1.1. Цель проекта
+Разработка автоматизированной системы мониторинга 30 корпоративных Telegram-чатов с функциями:
+- Анализа содержания сообщений (текст + голосовые) за последние 6 часов
+- Сверки состава участников с белым списком
+- Выявления подозрительного контента с помощью LLM
+- Отправки уведомлений администратору с интерактивным интерфейсом
+
+### 1.2. Архитектурная концепция
+
+Система построена на принципе **разделения ответственности** (Separation of Concerns):
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     TELEGRAM MONITOR SYSTEM                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+   ┌────▼────┐          ┌─────▼─────┐        ┌────▼─────┐
+   │COLLECTOR│          │  ANALYZER  │        │ MANAGER  │
+   │(Telethon│          │ (Core Logic│        │ (aiogram)│
+   │ Userbot)│          │    + LLM)  │        │   Bot)   │
+   └────┬────┘          └─────┬─────┘        └────┬─────┘
+        │                     │                     │
+        │    ┌────────────────┴────────────────┐   │
+        │    │                                  │   │
+        └────▼────────┐              ┌─────────▼───┘
+             │ STORAGE│              │ NOTIFIER    │
+             │ SQLite ├──────────────┤             │
+             │+ Sheets│              │   Admin     │
+             └────────┘              └─────────────┘
+```
+
+#### Компоненты системы:
+
+| Компонент | Технология | Роль | Преимущества |
+|-----------|-----------|------|--------------|
+| **Collector** | Telethon (MTProto) | Сбор данных | Доступ к истории, полный список участников |
+| **Analyzer** | Python + LLM API | Обработка контента | AI-анализ, транскрипция голосовых |
+| **Manager** | aiogram (Bot API) | Интерфейс управления | Команды, безлимитная отправка в ЛС |
+| **Storage** | SQLite + Google Sheets | Персистентность | Буферизация + облачная панель |
+
+### 1.3. Технический стек
+
+```python
+# Python 3.11+
+requirements = {
+    "telegram": ["Telethon>=1.34.0", "aiogram>=3.4.0"],
+    "async": ["APScheduler>=3.10.4", "aiohttp>=3.9.0"],
+    "storage": ["gspread_asyncio>=1.4.0", "aiosqlite>=0.20.0"],
+    "validation": ["pydantic>=2.6.0", "pydantic-settings>=2.2.0"],
+    "utils": ["python-dotenv>=1.0.1", "loguru>=0.7.2"]
+}
+```
+
+### 1.4. Принципы безопасности
+
+1. **Изоляция Userbot**: Используется отдельный технический аккаунт (не личный)
+2. **Anti-Flood защита**: Случайные задержки 10-30 сек между обработкой чатов
+3. **Secrets management**: Все токены в `.env`, не попадают в git
+4. **Graceful degradation**: SQLite как буфер при недоступности Sheets
+
+---
+
+## 2. Детальное описание модулей
+
+### 2.1. Модуль Collector (Telethon Userbot)
+
+**Назначение**: Молчаливый сбор данных из чатов без генерации нотификаций
+
+#### 2.1.1. Класс `TelethonCollector`
+
+```python
+# src/collector/client.py
+
+class TelethonCollector:
+    """
+    Менеджер сессии Telethon для сбора данных из чатов.
+    
+    Атрибуты:
+        client (TelegramClient): Основной клиент Telethon
+        session_path (Path): Путь к файлу сессии
+        flood_protection (FloodProtection): Менеджер защиты от флуда
+    """
+    
+    def __init__(self, api_id: int, api_hash: str, phone: str):
+        """Инициализация клиента с проверкой авторизации"""
+        
+    async def start_session(self) -> None:
+        """Запуск сессии с автоматическим вводом кода при первом запуске"""
+        
+    async def stop_session(self) -> None:
+        """Корректное завершение сессии с сохранением состояния"""
+        
+    async def health_check(self) -> bool:
+        """Проверка доступности аккаунта (не забанен ли)"""
+```
+
+**Зависимости**:
+- `telethon.TelegramClient`
+- `config.settings.TelethonSettings`
+- `utils.logger`
+
+**Входные данные**:
+- Конфигурация из `.env` (API_ID, API_HASH, PHONE)
+- Файл сессии `data/sessions/userbot.session`
+
+**Выходные данные**:
+- Инициализированный и авторизованный клиент Telethon
+
+---
+
+#### 2.1.2. Класс `MessageHistoryCollector`
+
+```python
+# src/collector/history.py
+
+class MessageHistoryCollector:
+    """
+    Сборщик истории сообщений из чатов.
+    
+    Методы:
+        collect_messages: Получение сообщений за последние N часов
+        download_voice: Скачивание голосового сообщения с таймаутом
+        deduplicate: Проверка дубликатов в SQLite перед записью
+    """
+    
+    async def collect_messages(
+        self,
+        chat_id: int,
+        hours_back: int = 6,
+        batch_size: int = 100
+    ) -> List[MessageData]:
+        """
+        Сбор сообщений за период времени.
+        
+        Логика:
+        1. Вычисление offset_date = now() - timedelta(hours=hours_back)
+        2. Вызов client.iter_messages(chat_id, offset_date=offset_date, limit=batch_size)
+        3. Для каждого сообщения:
+           - Извлечение текста/медиа
+           - Проверка на дубликаты (по message_id + chat_id)
+           - Если voice: вызов download_voice()
+        4. Возврат списка MessageData
+        
+        Параметры:
+            chat_id: ID чата
+            hours_back: Глубина сканирования (по умолчанию 6)
+            batch_size: Размер пакета для iter_messages
+            
+        Возвращает:
+            List[MessageData]: Список обработанных сообщений
+            
+        Исключения:
+            FloodWaitError: Повторная попытка через указанное время
+            ChatAdminRequiredError: Логирование и пропуск чата
+        """
+        
+    async def download_voice(
+        self,
+        message: Message,
+        timeout: int = 30,
+        max_size_mb: int = 50
+    ) -> Optional[Path]:
+        """
+        Скачивание голосового с защитой от зависания.
+        
+        Логика:
+        1. Проверка размера: message.voice.size <= max_size_mb * 1024 * 1024
+        2. Создание временного файла: data/temp/{chat_id}_{message_id}.ogg
+        3. Скачивание с таймаутом: asyncio.wait_for(message.download_media(), timeout)
+        4. Возврат пути к файлу или None при ошибке
+        
+        Параметры:
+            message: Объект сообщения Telethon
+            timeout: Таймаут скачивания в секундах
+            max_size_mb: Максимальный размер файла
+            
+        Возвращает:
+            Optional[Path]: Путь к скачанному файлу или None
+        """
+```
+
+**Зависимости**:
+- `telethon.client.TelegramClient`
+- `storage.database.MessageRepository`
+- `utils.flood_protection`
+
+**Входные данные**:
+- `chat_id`: ID чата для сканирования
+- `hours_back`: Глубина сканирования (из конфига, по умолчанию 6)
+
+**Выходные данные**:
+- `List[MessageData]`: Список сообщений с метаданными
+- Скачанные голосовые файлы в `data/temp/`
+
+---
+
+#### 2.1.3. Класс `ParticipantCollector`
+
+```python
+# src/collector/participants.py
+
+class ParticipantCollector:
+    """
+    Сборщик списка участников чата.
+    
+    Методы:
+        get_full_participants: Получение полного списка участников
+        compare_with_whitelist: Сверка с разрешенным списком
+    """
+    
+    async def get_full_participants(
+        self, 
+        chat_id: int
+    ) -> List[ParticipantData]:
+        """
+        Получение всех участников чата включая неактивных.
+        
+        Логика:
+        1. Вызов client.get_participants(chat_id, limit=None, aggressive=True)
+        2. Извлечение: user_id, username, first_name, last_name, is_bot
+        3. Возврат списка ParticipantData
+        
+        Параметры:
+            chat_id: ID чата
+            
+        Возвращает:
+            List[ParticipantData]: Список участников
+        """
+        
+    async def compare_with_whitelist(
+        self,
+        chat_id: int,
+        participants: List[ParticipantData],
+        whitelist: List[int]
+    ) -> ParticipantReport:
+        """
+        Сверка участников с белым списком.
+        
+        Логика:
+        1. Создание множеств: current_ids = {p.user_id for p in participants}
+        2. missing = set(whitelist) - current_ids (должны быть, но их нет)
+        3. extra = current_ids - set(whitelist) (есть, но не в списке)
+        4. Возврат ParticipantReport с результатами
+        
+        Возвращает:
+            ParticipantReport: Отчет с missing и extra участниками
+        """
+```
+
+**Зависимости**:
+- `telethon.client.TelegramClient`
+- `storage.sheets.WhitelistProvider`
+
+**Входные данные**:
+- `chat_id`: ID чата
+- `whitelist`: Список разрешенных user_id из Google Sheets
+
+**Выходные данные**:
+- `ParticipantReport`: Объект с полями `missing` и `extra`
+
+---
+
+### 2.2. Модуль Analyzer (Core Logic)
+
+**Назначение**: Обработка собранных данных, анализ с помощью LLM и Whisper
+
+#### 2.2.1. Класс `WhisperClient`
+
+```python
+# src/core/whisper.py
+
+class WhisperClient:
+    """
+    Клиент для транскрипции голосовых через CometAPI Whisper.
+    
+    Атрибуты:
+        api_key (str): Ключ API
+        api_url (str): Endpoint для Whisper
+        session (aiohttp.ClientSession): HTTP сессия
+    """
+    
+    async def transcribe_voice(
+        self,
+        audio_path: Path,
+        language: str = "ru"
+    ) -> TranscriptionResult:
+        """
+        Транскрипция голосового сообщения.
+        
+        Логика:
+        1. Чтение файла: audio_data = audio_path.read_bytes()
+        2. Формирование multipart/form-data запроса
+        3. POST на {api_url}/v1/audio/transcriptions
+        4. Парсинг ответа: {"text": "...", "language": "ru", "duration": 12.5}
+        5. Удаление временного файла
+        6. Возврат TranscriptionResult
+        
+        Параметры:
+            audio_path: Путь к аудиофайлу (.ogg)
+            language: Язык для распознавания
+            
+        Возвращает:
+            TranscriptionResult: Объект с текстом и метаданными
+            
+        Исключения:
+            WhisperAPIError: При ошибках API
+        """
+```
+
+**API Endpoint**:
+```http
+POST https://api.comet.com/v1/audio/transcriptions
+Content-Type: multipart/form-data
+Authorization: Bearer {COMET_API_KEY}
+
+{
+  "file": <binary_data>,
+  "model": "whisper-1",
+  "language": "ru"
+}
+```
+
+**Формат ответа**:
+```json
+{
+  "text": "Добрый день, коллеги. Хочу обсудить текущую ситуацию.",
+  "language": "ru",
+  "duration": 8.3,
+  "segments": [...]
+}
+```
+
+---
+
+#### 2.2.2. Класс `LLMClient`
+
+```python
+# src/core/llm_client.py
+
+class LLMClient:
+    """
+    Клиент для анализа текста через CometAPI LLM.
+    
+    Методы:
+        analyze_messages: Анализ батча сообщений
+        chunk_messages: Разбиение сообщений на чанки
+    """
+    
+    async def analyze_messages(
+        self,
+        messages: List[MessageData],
+        chat_name: str
+    ) -> AnalysisResult:
+        """
+        Анализ сообщений на предмет нарушений.
+        
+        Логика:
+        1. Разбиение messages на чанки (chunk_messages)
+        2. Для каждого чанка:
+           - Формирование промпта с JSON-схемой
+           - POST запрос к LLM API
+           - Валидация ответа через Pydantic
+        3. Агрегация результатов из всех чанков
+        4. Возврат AnalysisResult
+        
+        Параметры:
+            messages: Список сообщений для анализа
+            chat_name: Название чата для контекста
+            
+        Возвращает:
+            AnalysisResult: Найденные инциденты + общая статистика
+        """
+        
+    def chunk_messages(
+        self,
+        messages: List[MessageData],
+        max_tokens: int = 4000,
+        max_messages: int = 50
+    ) -> List[List[MessageData]]:
+        """
+        Разбиение сообщений на пакеты.
+        
+        Логика:
+        1. Оценка токенов: len(text) // 4 (приблизительно)
+        2. Формирование чанков с соблюдением лимитов
+        3. Возврат списка чанков
+        """
+```
+
+**API Endpoint**:
+```http
+POST https://api.comet.com/v1/chat/completions
+Content-Type: application/json
+Authorization: Bearer {COMET_API_KEY}
+
+{
+  "model": "gpt-4-turbo",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Ты - система анализа корпоративных сообщений..."
+    },
+    {
+      "role": "user",
+      "content": "Проанализируй следующие сообщения:\n\n{messages_batch}"
+    }
+  ],
+  "response_format": {"type": "json_object"},
+  "temperature": 0.3
+}
+```
+
+**Промпт для LLM**:
+```text
+SYSTEM PROMPT:
+Ты - система безопасности для корпоративного мониторинга Telegram-чатов.
+Твоя задача - анализировать сообщения и выявлять потенциальные нарушения.
+
+КАТЕГОРИИ НАРУШЕНИЙ:
+1. leak - утечка конфиденциальной информации (пароли, API ключи, внутренние данные)
+2. inappropriate - неподобающее поведение (оскорбления, домогательства, дискриминация)
+3. spam - спам или реклама сторонних сервисов
+4. off_topic - обсуждение нерабочих тем в рабочем чате
+5. security_risk - потенциальная угроза безопасности (фишинг, вредоносные ссылки)
+
+ФОРМАТ ОТВЕТА (строгий JSON):
+{
+  "incidents": [
+    {
+      "message_id": <int>,
+      "category": "<leak|inappropriate|spam|off_topic|security_risk>",
+      "severity": "<low|medium|high|critical>",
+      "description": "<краткое описание нарушения>",
+      "confidence": <float 0-1>
+    }
+  ],
+  "summary": {
+    "total_analyzed": <int>,
+    "incidents_found": <int>,
+    "risk_level": "<none|low|medium|high>"
+  }
+}
+
+USER PROMPT:
+Чат: "{chat_name}"
+Период: последние 6 часов
+
+Сообщения для анализа:
+---
+{formatted_messages}
+---
+
+Проанализируй эти сообщения и верни результат в формате JSON.
+```
+
+**Формат `formatted_messages`**:
+```text
+[ID: 12345] [2026-02-02 15:30] @username: Текст сообщения
+[ID: 12346] [2026-02-02 15:32] @another_user: Другое сообщение
+[ID: 12347] [VOICE] [2026-02-02 15:35] @voice_user: [Транскрипция] Содержание голосового
+```
+
+---
+
+#### 2.2.3. Класс `ContentAnalyzer`
+
+```python
+# src/core/analyzer.py
+
+class ContentAnalyzer:
+    """
+    Оркестратор анализа контента (комбинирует Whisper + LLM).
+    
+    Атрибуты:
+        whisper_client (WhisperClient): Клиент для STT
+        llm_client (LLMClient): Клиент для LLM
+        db (MessageRepository): Репозиторий для кэширования
+    """
+    
+    async def process_chat(
+        self,
+        chat_id: int,
+        messages: List[MessageData]
+    ) -> ChatAnalysisResult:
+        """
+        Полная обработка одного чата.
+        
+        АЛГОРИТМ:
+        1. Фильтрация новых сообщений (не в SQLite)
+        2. Обработка голосовых:
+           for msg in messages:
+               if msg.has_voice:
+                   transcription = await whisper_client.transcribe_voice(msg.voice_path)
+                   msg.text += f"\n[Транскрипция] {transcription.text}"
+        3. LLM анализ:
+           analysis = await llm_client.analyze_messages(messages, chat_name)
+        4. Сохранение результатов в SQLite
+        5. Возврат ChatAnalysisResult
+        
+        Параметры:
+            chat_id: ID чата
+            messages: Собранные сообщения из Collector
+            
+        Возвращает:
+            ChatAnalysisResult: Результаты анализа + статистика
+        """
+        
+    async def aggregate_results(
+        self,
+        chat_results: List[ChatAnalysisResult]
+    ) -> GlobalReport:
+        """
+        Агрегация результатов по всем чатам.
+        
+        Логика:
+        1. Подсчет общей статистики
+        2. Ранжирование инцидентов по severity
+        3. Формирование сводки для администратора
+        4. Возврат GlobalReport
+        """
+```
+
+**Зависимости**:
+- `WhisperClient`
+- `LLMClient`
+- `storage.database.MessageRepository`
+
+**Входные данные**:
+- `chat_id` и `List[MessageData]` из Collector
+
+**Выходные данные**:
+- `ChatAnalysisResult`: Список инцидентов + метрики
+- Обновление записей в SQLite
+
+---
+
+### 2.3. Модуль Manager (aiogram Bot)
+
+**Назначение**: Интерфейс управления и отправка уведомлений
+
+#### 2.3.1. Класс `TelegramBot`
+
+```python
+# src/manager/bot.py
+
+class TelegramBot:
+    """
+    Менеджер официального бота для команд и уведомлений.
+    
+    Методы:
+        start: Запуск long polling
+        stop: Остановка бота
+    """
+    
+    def __init__(self, token: str, admin_id: int):
+        """
+        Инициализация бота с регистрацией хэндлеров.
+        
+        Логика:
+        1. Создание Bot и Dispatcher
+        2. Регистрация роутеров из handlers.py
+        3. Настройка middleware для логирования
+        """
+        
+    async def start_polling(self):
+        """Запуск long polling в фоне"""
+        
+    async def stop_polling(self):
+        """Корректная остановка с завершением pending tasks"""
+```
+
+---
+
+#### 2.3.2. Модуль `handlers`
+
+```python
+# src/manager/handlers.py
+
+router = Router()
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    """
+    Приветствие и справка.
+    
+    Ответ:
+    '''
+    🤖 Система мониторинга чатов v1.0
+    
+    Доступные команды:
+    /status - Текущее состояние системы
+    /scan - Запустить сканирование принудительно
+    /stats - Статистика за последний период
+    /help - Справка
+    '''
+    """
+
+@router.message(Command("status"))
+async def cmd_status(message: Message, scheduler: APScheduler):
+    """
+    Отчет о состоянии системы.
+    
+    Логика:
+    1. Проверка статуса Telethon (health_check)
+    2. Получение времени следующего сканирования из APScheduler
+    3. Подсчет количества чатов на мониторинге
+    4. Формирование ответа с инлайн-кнопками
+    
+    Ответ:
+    '''
+    📊 Статус системы:
+    ✅ Userbot: Активен
+    🕐 Следующее сканирование: через 2 часа 15 минут
+    📁 Чатов на мониторинге: 30
+    
+    [🔄 Обновить] [📈 Детальная статистика]
+    '''
+    """
+
+@router.message(Command("scan"))
+async def cmd_force_scan(message: Message):
+    """
+    Принудительный запуск сканирования.
+    
+    Логика:
+    1. Проверка прав (только admin_id)
+    2. Запуск scan_all_chats() в фоне
+    3. Отправка уведомления о начале
+    4. По завершении - отправка результатов
+    """
+
+@router.callback_query(F.data.startswith("incident_"))
+async def handle_incident_action(callback: CallbackQuery):
+    """
+    Обработка действий по инциденту.
+    
+    Формат callback_data: "incident_{action}_{incident_id}"
+    Actions: false_positive, confirm, add_to_whitelist
+    
+    Логика:
+    1. Парсинг callback_data
+    2. Обновление статуса инцидента в SQLite
+    3. Редактирование сообщения (добавление метки ✅ или ❌)
+    4. Запись в лог Google Sheets
+    """
+```
+
+**Формат команд**:
+```python
+COMMANDS = [
+    BotCommand(command="start", description="Запустить бота"),
+    BotCommand(command="status", description="Статус системы"),
+    BotCommand(command="scan", description="Сканировать сейчас"),
+    BotCommand(command="stats", description="Статистика"),
+    BotCommand(command="help", description="Справка"),
+]
+```
+
+---
+
+#### 2.3.3. Класс `Notifier`
+
+```python
+# src/manager/notifier.py
+
+class IncidentNotifier:
+    """
+    Формирование и отправка уведомлений администратору.
+    
+    Методы:
+        send_incident_alert: Отправка карточки инцидента
+        send_summary_report: Отправка сводного отчета
+    """
+    
+    async def send_incident_alert(
+        self,
+        admin_id: int,
+        incident: Incident
+    ):
+        """
+        Отправка уведомления об одном инциденте.
+        
+        Формат сообщения:
+        '''
+        🚨 ИНЦИДЕНТ #{id}
+        
+        📍 Чат: {chat_name}
+        👤 Пользователь: @{username}
+        🕐 Время: {timestamp}
+        
+        📂 Категория: {category_emoji} {category_name}
+        ⚠️ Критичность: {severity}
+        🎯 Уверенность: {confidence}%
+        
+        💬 Текст:
+        {message_text}
+        
+        📝 Описание:
+        {description}
+        '''
+        
+        Кнопки:
+        [❌ Ложное срабатывание] [✅ Подтвердить]
+        [📋 Подробнее] [🔇 Игнорировать автора]
+        """
+        
+    async def send_summary_report(
+        self,
+        admin_id: int,
+        report: GlobalReport
+    ):
+        """
+        Отправка сводного отчета после сканирования.
+        
+        Формат:
+        '''
+        📊 СВОДНЫЙ ОТЧЕТ
+        Период: {start_time} - {end_time}
+        
+        ✅ Проверено чатов: {total_chats}
+        📨 Обработано сообщений: {total_messages}
+        🎙 Транскрибировано голосовых: {total_voices}
+        
+        🚨 Найдено инцидентов: {total_incidents}
+           • Критичные: {critical_count}
+           • Высокие: {high_count}
+           • Средние: {medium_count}
+        
+        👥 Сверка участников:
+           • Недостающие: {missing_count}
+           • Лишние: {extra_count}
+        
+        [📄 Открыть отчет в Sheets] [📊 Детали]
+        '''
+        """
+```
+
+**Эмодзи-маппинг для категорий**:
+```python
+CATEGORY_EMOJIS = {
+    "leak": "🔐",
+    "inappropriate": "⚠️",
+    "spam": "📢",
+    "off_topic": "💬",
+    "security_risk": "🛡"
+}
+
+SEVERITY_EMOJIS = {
+    "critical": "🔴",
+    "high": "🟠",
+    "medium": "🟡",
+    "low": "🟢"
+}
+```
+
+---
+
+### 2.4. Модуль Storage (SQLite + Google Sheets)
+
+#### 2.4.1. База данных SQLite
+
+```python
+# src/storage/database.py
+
+class DatabaseManager:
+    """
+    Менеджер SQLite для локального кэширования.
+    
+    Методы:
+        init_db: Создание таблиц
+        insert_message: Добавление сообщения
+        get_messages: Получение сообщений
+    """
+    
+    async def init_db(self):
+        """
+        Создание структуры БД.
+        
+        SQL:
+        - CREATE TABLE messages (...)
+        - CREATE TABLE incidents (...)
+        - CREATE TABLE participants (...)
+        - CREATE TABLE scan_logs (...)
+        - CREATE UNIQUE INDEX idx_message_unique ON messages(chat_id, message_id)
+        """
+```
+
+**Схема таблиц** (см. раздел 3.1)
+
+---
+
+#### 2.4.2. Google Sheets Integration
+
+```python
+# src/storage/sheets.py
+
+class GoogleSheetsManager:
+    """
+    Менеджер Google Sheets для конфигурации и отчетов.
+    
+    Атрибуты:
+        client (gspread_asyncio.AsyncioGspreadClient): Клиент Google Sheets
+        spreadsheet_id (str): ID таблицы
+    """
+    
+    async def get_whitelist(self) -> Dict[int, List[int]]:
+        """
+        Получение whitelist из листа 'Конфигурация'.
+        
+        Логика:
+        1. Чтение листа 'Конфигурация'
+        2. Парсинг столбцов: chat_id | chat_name | allowed_users
+        3. Разбор allowed_users (comma-separated IDs)
+        4. Возврат Dict[chat_id, List[user_ids]]
+        
+        Формат листа 'Конфигурация':
+        | chat_id      | chat_name        | allowed_users           |
+        |--------------|------------------|-------------------------|
+        | -1001234567  | Marketing Team   | 123456,789012,345678    |
+        | -1009876543  | Dev Team         | 111222,333444,555666    |
+        """
+        
+    async def append_incidents(
+        self,
+        incidents: List[Incident]
+    ):
+        """
+        Добавление инцидентов в лист 'Инциденты'.
+        
+        Логика:
+        1. Форматирование incidents в строки
+        2. Вызов worksheet.append_rows(formatted_rows)
+        3. Сортировка по severity (опционально)
+        
+        Формат листа 'Инциденты':
+        | timestamp            | chat_name | username | category | severity | description | status |
+        |----------------------|-----------|----------|----------|----------|-------------|--------|
+        | 2026-02-02 15:30:00 | Marketing | @user1   | leak     | high     | Утечка API  | new    |
+        """
+        
+    async def append_participant_report(
+        self,
+        report: ParticipantReport
+    ):
+        """
+        Запись результатов сверки участников.
+        
+        Формат листа 'Участники':
+        | scan_date           | chat_name | status  | user_id | username |
+        |---------------------|-----------|---------|---------|----------|
+        | 2026-02-02 18:00:00| Dev Team  | missing | 123456  | @john    |
+        | 2026-02-02 18:00:00| Dev Team  | extra   | 999999  | @unknown |
+        """
+        
+    async def append_scan_log(
+        self,
+        log: ScanLog
+    ):
+        """
+        Логирование факта сканирования.
+        
+        Формат листа 'Логи':
+        | timestamp            | chats_scanned | messages_processed | incidents_found | duration_sec |
+        |----------------------|---------------|--------------------|--------------------|-------------|
+        | 2026-02-02 18:00:00 | 30            | 1543               | 7                  | 42.5        |
+        """
+```
+
+---
+
+### 2.5. Модуль Scheduler
+
+```python
+# src/scheduler/jobs.py
+
+class ScanJob:
+    """
+    Основная задача сканирования всех чатов.
+    
+    Методы:
+        run: Выполнение полного цикла сканирования
+    """
+    
+    async def run(self):
+        """
+        ПОЛНЫЙ ЦИКЛ СКАНИРОВАНИЯ
+        
+        АЛГОРИТМ:
+        1. Инициализация компонентов:
+           - collector = TelethonCollector()
+           - analyzer = ContentAnalyzer()
+           - notifier = IncidentNotifier()
+           
+        2. Получение whitelist из Google Sheets
+        
+        3. Для каждого chat_id в whitelist:
+           a) Сбор данных:
+              - messages = await collector.collect_messages(chat_id, hours_back=6)
+              - participants = await collector.get_full_participants(chat_id)
+           
+           b) Защита от флуда:
+              - await asyncio.sleep(random.randint(10, 30))
+           
+           c) Анализ:
+              - chat_result = await analyzer.process_chat(chat_id, messages)
+              - participant_report = await collector.compare_with_whitelist(
+                  chat_id, participants, whitelist[chat_id]
+                )
+           
+           d) Сохранение:
+              - await sheets.append_incidents(chat_result.incidents)
+              - await sheets.append_participant_report(participant_report)
+           
+           e) Уведомления (если есть инциденты):
+              for incident in chat_result.incidents:
+                  if incident.severity in ["high", "critical"]:
+                      await notifier.send_incident_alert(admin_id, incident)
+        
+        4. Агрегация результатов:
+           - global_report = analyzer.aggregate_results(all_chat_results)
+           - await notifier.send_summary_report(admin_id, global_report)
+           - await sheets.append_scan_log(global_report.to_scan_log())
+        
+        5. Очистка:
+           - Удаление временных голосовых файлов из data/temp/
+        """
+```
+
+**Конфигурация планировщика**:
+```python
+# main.py
+
+scheduler = AsyncIOScheduler()
+
+# Основное задание - каждые 6 часов
+scheduler.add_job(
+    ScanJob().run,
+    trigger='interval',
+    hours=6,
+    id='main_scan',
+    replace_existing=True,
+    max_instances=1  # Предотвращение наложения
+)
+
+# Health check - каждые 15 минут
+scheduler.add_job(
+    health_check_job,
+    trigger='interval',
+    minutes=15,
+    id='health_check'
+)
+
+scheduler.start()
+```
+
+---
+
+## 3. Структуры данных
+
+### 3.1. Схема SQLite
+
+```sql
+-- Таблица сообщений (дедупликация)
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    sender_id BIGINT,
+    sender_username TEXT,
+    text TEXT,
+    has_voice BOOLEAN DEFAULT 0,
+    voice_transcription TEXT,
+    timestamp DATETIME NOT NULL,
+    collected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(chat_id, message_id)
+);
+
+CREATE INDEX idx_message_timestamp ON messages(chat_id, timestamp);
+CREATE INDEX idx_message_collected ON messages(collected_at);
+
+-- Таблица инцидентов
+CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id BIGINT,
+    chat_id BIGINT NOT NULL,
+    chat_name TEXT,
+    sender_id BIGINT,
+    sender_username TEXT,
+    category TEXT NOT NULL, -- leak, inappropriate, spam, off_topic, security_risk
+    severity TEXT NOT NULL, -- low, medium, high, critical
+    description TEXT,
+    confidence REAL,
+    status TEXT DEFAULT 'new', -- new, confirmed, false_positive, ignored
+    detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    resolved_at DATETIME,
+    resolved_by BIGINT,
+    FOREIGN KEY (chat_id, message_id) REFERENCES messages(chat_id, message_id)
+);
+
+CREATE INDEX idx_incident_status ON incidents(status, severity);
+CREATE INDEX idx_incident_chat ON incidents(chat_id, detected_at);
+
+-- Таблица участников (снапшот)
+CREATE TABLE IF NOT EXISTS participants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    is_bot BOOLEAN DEFAULT 0,
+    snapshot_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(chat_id, user_id, snapshot_date)
+);
+
+CREATE INDEX idx_participant_chat ON participants(chat_id, snapshot_date);
+
+-- Таблица логов сканирований
+CREATE TABLE IF NOT EXISTS scan_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_time DATETIME NOT NULL,
+    end_time DATETIME,
+    chats_scanned INTEGER DEFAULT 0,
+    messages_processed INTEGER DEFAULT 0,
+    voices_transcribed INTEGER DEFAULT 0,
+    incidents_found INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'running', -- running, completed, failed
+    error_message TEXT,
+    duration_seconds REAL
+);
+
+CREATE INDEX idx_scan_date ON scan_logs(start_time);
+```
+
+---
+
+### 3.2. Pydantic модели
+
+```python
+# src/models/data.py
+
+from pydantic import BaseModel, Field
+from datetime import datetime
+from typing import Optional, List
+from enum import Enum
+
+# ===== ENUMS =====
+
+class IncidentCategory(str, Enum):
+    LEAK = "leak"
+    INAPPROPRIATE = "inappropriate"
+    SPAM = "spam"
+    OFF_TOPIC = "off_topic"
+    SECURITY_RISK = "security_risk"
+
+class Severity(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+class IncidentStatus(str, Enum):
+    NEW = "new"
+    CONFIRMED = "confirmed"
+    FALSE_POSITIVE = "false_positive"
+    IGNORED = "ignored"
+
+# ===== DATA MODELS =====
+
+class MessageData(BaseModel):
+    """Модель сообщения из Telegram"""
+    chat_id: int
+    message_id: int
+    sender_id: Optional[int]
+    sender_username: Optional[str]
+    text: Optional[str]
+    has_voice: bool = False
+    voice_path: Optional[str] = None
+    voice_transcription: Optional[str] = None
+    timestamp: datetime
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "chat_id": -1001234567890,
+                "message_id": 12345,
+                "sender_id": 123456789,
+                "sender_username": "john_doe",
+                "text": "Привет, коллеги!",
+                "has_voice": False,
+                "timestamp": "2026-02-02T15:30:00"
+            }
+        }
+
+class TranscriptionResult(BaseModel):
+    """Результат транскрипции голосового"""
+    text: str
+    language: str = "ru"
+    duration: float
+    confidence: Optional[float] = None
+
+class Incident(BaseModel):
+    """Модель инцидента безопасности"""
+    id: Optional[int] = None
+    message_id: int
+    chat_id: int
+    chat_name: str
+    sender_id: Optional[int]
+    sender_username: Optional[str]
+    category: IncidentCategory
+    severity: Severity
+    description: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    status: IncidentStatus = IncidentStatus.NEW
+    detected_at: datetime = Field(default_factory=datetime.now)
+    
+    def to_dict(self) -> dict:
+        """Сериализация для Google Sheets"""
+        return {
+            "timestamp": self.detected_at.isoformat(),
+            "chat_name": self.chat_name,
+            "username": self.sender_username or "Unknown",
+            "category": self.category.value,
+            "severity": self.severity.value,
+            "description": self.description,
+            "confidence": f"{self.confidence:.2%}",
+            "status": self.status.value
+        }
+
+class ParticipantData(BaseModel):
+    """Модель участника чата"""
+    user_id: int
+    username: Optional[str]
+    first_name: Optional[str]
+    last_name: Optional[str]
+    is_bot: bool = False
+
+class ParticipantReport(BaseModel):
+    """Отчет о сверке участников"""
+    chat_id: int
+    chat_name: str
+    missing: List[ParticipantData] = []  # Должны быть, но их нет
+    extra: List[ParticipantData] = []    # Есть, но не в whitelist
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+class ChatAnalysisResult(BaseModel):
+    """Результат анализа одного чата"""
+    chat_id: int
+    chat_name: str
+    messages_analyzed: int
+    voices_transcribed: int
+    incidents: List[Incident]
+    processing_time: float
+    
+class GlobalReport(BaseModel):
+    """Сводный отчет по всем чатам"""
+    scan_id: int
+    start_time: datetime
+    end_time: datetime
+    chats_scanned: int
+    total_messages: int
+    total_voices: int
+    total_incidents: int
+    critical_incidents: int
+    high_incidents: int
+    medium_incidents: int
+    low_incidents: int
+    missing_participants: int
+    extra_participants: int
+    duration_seconds: float
+    
+    def to_scan_log(self) -> dict:
+        """Преобразование в формат для scan_logs таблицы"""
+        return {
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "chats_scanned": self.chats_scanned,
+            "messages_processed": self.total_messages,
+            "voices_transcribed": self.total_voices,
+            "incidents_found": self.total_incidents,
+            "status": "completed",
+            "duration_seconds": self.duration_seconds
+        }
+```
+
+---
+
+### 3.3. Конфигурация (Settings)
+
+```python
+# config/settings.py
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pathlib import Path
+
+class TelethonSettings(BaseSettings):
+    """Настройки Telethon Userbot"""
+    api_id: int
+    api_hash: str
+    phone: str
+    session_path: Path = Path("data/sessions/userbot.session")
+    
+    model_config = SettingsConfigDict(env_prefix="TG_")
+
+class AiogramSettings(BaseSettings):
+    """Настройки aiogram Bot"""
+    bot_token: str
+    admin_id: int
+    
+    model_config = SettingsConfigDict(env_prefix="BOT_")
+
+class CometAPISettings(BaseSettings):
+    """Настройки CometAPI"""
+    api_key: str
+    api_url: str = "https://api.comet.com/v1"
+    whisper_model: str = "whisper-1"
+    llm_model: str = "gpt-4-turbo"
+    
+    model_config = SettingsConfigDict(env_prefix="COMET_")
+
+class GoogleSheetsSettings(BaseSettings):
+    """Настройки Google Sheets"""
+    spreadsheet_id: str
+    service_account_path: Path = Path("config/service_account.json")
+    
+    model_config = SettingsConfigDict(env_prefix="GOOGLE_")
+
+class AppSettings(BaseSettings):
+    """Основные настройки приложения"""
+    scan_interval_hours: int = 6
+    max_messages_per_chunk: int = 50
+    max_chunk_tokens: int = 4000
+    voice_download_timeout: int = 30
+    voice_max_size_mb: int = 50
+    flood_delay_min: int = 10
+    flood_delay_max: int = 30
+    
+    model_config = SettingsConfigDict(env_prefix="APP_")
+
+class Settings:
+    """Общий класс настроек"""
+    telethon: TelethonSettings
+    aiogram: AiogramSettings
+    comet_api: CometAPISettings
+    google_sheets: GoogleSheetsSettings
+    app: AppSettings
+    
+    def __init__(self):
+        self.telethon = TelethonSettings()
+        self.aiogram = AiogramSettings()
+        self.comet_api = CometAPISettings()
+        self.google_sheets = GoogleSheetsSettings()
+        self.app = AppSettings()
+
+# Singleton
+settings = Settings()
+```
+
+---
+
+### 3.4. Структура Google Sheets
+
+**Лист: "Конфигурация"**
+
+| chat_id       | chat_name        | allowed_users               | monitoring_enabled |
+|---------------|------------------|-----------------------------|-------------------|
+| -1001234567   | Marketing Team   | 123456,789012,345678        | TRUE              |
+| -1009876543   | Dev Team         | 111222,333444,555666        | TRUE              |
+| -1005555555   | HR Chat          | 777888,999000               | FALSE             |
+
+**Лист: "Инциденты"**
+
+| timestamp            | chat_name    | username  | category        | severity | description           | confidence | status    |
+|----------------------|--------------|-----------|-----------------|----------|-----------------------|-----------|-----------|
+| 2026-02-02 15:30:00 | Marketing    | @user1    | leak            | high     | Утечка API ключа      | 95%       | new       |
+| 2026-02-02 16:15:00 | Dev Team     | @dev2     | inappropriate   | medium   | Оскорбление коллеги   | 78%       | confirmed |
+
+**Лист: "Участники"**
+
+| scan_date            | chat_name    | status  | user_id  | username  | first_name | last_name |
+|----------------------|--------------|---------|----------|-----------|-----------|-----------|
+| 2026-02-02 18:00:00 | Marketing    | missing | 123456   | @john     | John      | Doe       |
+| 2026-02-02 18:00:00 | Dev Team     | extra   | 999999   | @unknown  | Unknown   | User      |
+
+**Лист: "Логи"**
+
+| timestamp            | chats_scanned | messages_processed | voices_transcribed | incidents_found | duration_sec | status    |
+|----------------------|---------------|--------------------|--------------------|-----------------|-------------|-----------|
+| 2026-02-02 18:00:00 | 30            | 1543               | 47                 | 7               | 42.5        | completed |
+| 2026-02-02 12:00:00 | 30            | 1289               | 38                 | 3               | 38.2        | completed |
+
+---
+
+## 4. Взаимодействие компонентов
+
+### 4.1. Диаграмма последовательности (полный цикл)
+
+```
+┌────────┐       ┌─────────┐      ┌─────────┐      ┌────────┐      ┌────────┐
+│Scheduler│      │Collector│      │Analyzer │      │Manager │      │Storage │
+└───┬────┘      └────┬────┘      └────┬────┘      └───┬────┘      └───┬────┘
+    │                │                 │                │                │
+    │ Trigger(6h)    │                 │                │                │
+    ├────────────────>                 │                │                │
+    │                │                 │                │                │
+    │        ┌───────┴─────────┐       │                │                │
+    │        │ Get Whitelist   │       │                │                │
+    │        │ from Sheets     │───────┼────────────────┼───────────────>│
+    │        └───────┬─────────┘       │                │                │
+    │                │<────────────────┼────────────────┼────────────────│
+    │                │                 │                │                │
+    │        for each chat:            │                │                │
+    │        │                         │                │                │
+    │        │ iter_messages(6h)       │                │                │
+    │        ├─────────────────────────┼────────────────┼────────────────┤
+    │        │ get_participants()      │                │                │
+    │        ├─────────────────────────┼────────────────┼────────────────┤
+    │        │                         │                │                │
+    │        │ sleep(random 10-30s)    │                │                │
+    │        ├─────────────────────────┼────────────────┼────────────────┤
+    │        │                         │                │                │
+    │        │ MessageData[]           │                │                │
+    │        ├────────────────────────>│                │                │
+    │        │                         │                │                │
+    │        │                ┌────────┴────────┐       │                │
+    │        │                │ For voice msgs: │       │                │
+    │        │                │ Whisper STT     │       │                │
+    │        │                └────────┬────────┘       │                │
+    │        │                         │                │                │
+    │        │                ┌────────┴────────┐       │                │
+    │        │                │ Chunk messages  │       │                │
+    │        │                │ Send to LLM     │       │                │
+    │        │                └────────┬────────┘       │                │
+    │        │                         │                │                │
+    │        │                ChatAnalysisResult        │                │
+    │        │<────────────────────────┤                │                │
+    │        │                         │                │                │
+    │        │ Save to SQLite & Sheets │                │                │
+    │        ├────────────────────────┼────────────────┼───────────────>│
+    │        │                         │                │                │
+    │        │ if incidents.severity >= high:          │                │
+    │        ├────────────────────────┼───────────────>│                │
+    │        │                         │                │                │
+    │        │                         │     ┌──────────┴─────────┐     │
+    │        │                         │     │ send_incident_alert│     │
+    │        │                         │     │ to admin           │     │
+    │        │                         │     └──────────┬─────────┘     │
+    │        │                         │                │                │
+    │        end for each chat         │                │                │
+    │        │                         │                │                │
+    │        │ GlobalReport            │                │                │
+    │        ├────────────────────────>│                │                │
+    │        │                         │                │                │
+    │        │                         │ send_summary_report            │
+    │        ├────────────────────────┼───────────────>│                │
+    │        │                         │                │                │
+    │        │ Save scan log           │                │                │
+    │        ├────────────────────────┼────────────────┼───────────────>│
+    │        │                         │                │                │
+    │  End cycle                       │                │                │
+    │<───────┤                         │                │                │
+```
+
+### 4.2. Потоки данных
+
+**1. Конфигурация → Сборщик**
+```python
+# Google Sheets (Конфигурация) → Collector
+whitelist = await sheets_manager.get_whitelist()
+# whitelist = {
+#     -1001234567: [123456, 789012, 345678],
+#     -1009876543: [111222, 333444, 555666]
+# }
+
+for chat_id, allowed_users in whitelist.items():
+    if not await sheets_manager.is_monitoring_enabled(chat_id):
+        continue
+    # Сбор данных...
+```
+
+**2. Сборщик → Анализатор**
+```python
+# Collector → Analyzer
+messages = await collector.collect_messages(chat_id, hours_back=6)
+participants = await collector.get_full_participants(chat_id)
+
+# messages: List[MessageData]
+# participants: List[ParticipantData]
+
+chat_result = await analyzer.process_chat(chat_id, messages)
+participant_report = await collector.compare_with_whitelist(
+    chat_id, participants, whitelist[chat_id]
+)
+```
+
+**3. Анализатор → Хранилище**
+```python
+# Analyzer → Storage
+await db.insert_incidents(chat_result.incidents)
+await sheets.append_incidents(chat_result.incidents)
+await sheets.append_participant_report(participant_report)
+```
+
+**4. Анализатор → Менеджер**
+```python
+# Analyzer → Manager (через Notifier)
+for incident in chat_result.incidents:
+    if incident.severity in [Severity.HIGH, Severity.CRITICAL]:
+        await notifier.send_incident_alert(admin_id, incident)
+
+# После завершения цикла
+global_report = analyzer.aggregate_results(all_chat_results)
+await notifier.send_summary_report(admin_id, global_report)
+```
+
+### 4.3. Обработка ошибок
+
+**FloodWait (Telethon)**
+```python
+from telethon.errors import FloodWaitError
+import asyncio
+
+async def safe_collect_messages(chat_id: int):
+    try:
+        messages = await collector.collect_messages(chat_id)
+    except FloodWaitError as e:
+        logger.warning(f"FloodWait {e.seconds}s for chat {chat_id}")
+        await asyncio.sleep(e.seconds + 10)  # +10 для запаса
+        messages = await collector.collect_messages(chat_id)  # Повтор
+    return messages
+```
+
+**API Timeout (CometAPI)**
+```python
+async def safe_api_call(func, *args, max_retries=3, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            return await asyncio.wait_for(func(*args, **kwargs), timeout=60)
+        except asyncio.TimeoutError:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+```
+
+**Google Sheets Rate Limit**
+```python
+from gspread.exceptions import APIError
+
+async def safe_sheets_write(func, *args, **kwargs):
+    try:
+        return await func(*args, **kwargs)
+    except APIError as e:
+        if "RATE_LIMIT_EXCEEDED" in str(e):
+            # Fallback: сохранение только в SQLite
+            logger.error("Sheets rate limit, using SQLite only")
+            return None
+        raise
+```
+
+---
+
+## 5. Поэтапный план разработки
+
+### ЭТАП 1: MVP (Минимально жизнеспособный продукт)
+
+**Цель**: Демонстрация клиенту базового функционала - сбор, анализ, уведомления
+
+**Сроки**: 10-14 дней  
+**Приоритет**: КРИТИЧЕСКИЙ
+
+#### Задачи Этапа 1:
+
+| № | Задача | Описание | Оценка | Зависимости |
+|---|--------|----------|--------|-------------|
+| 1.1 | Инициализация проекта | Создание структуры папок, requirements.txt, .env | 2ч | - |
+| 1.2 | SQLite схема и база | Создание таблиц messages, incidents, scan_logs | 3ч | 1.1 |
+| 1.3 | Pydantic модели | Реализация всех data models из раздела 3.2 | 4ч | 1.1 |
+| 1.4 | Settings & Configuration | Pydantic-settings для всех конфигов | 3ч | 1.1, 1.3 |
+| 1.5 | Logger setup | Настройка Loguru с ротацией файлов | 2ч | 1.1 |
+| **1.6** | **Telethon Client** | **Инициализация userbot, авторизация** | **6ч** | **1.4, 1.5** |
+| **1.7** | **MessageHistoryCollector** | **Реализация collect_messages (БЕЗ голосовых)** | **8ч** | **1.2, 1.3, 1.6** |
+| **1.8** | **ParticipantCollector** | **get_full_participants + compare_with_whitelist** | **6ч** | **1.3, 1.6** |
+| 1.9 | Google Sheets базовая интеграция | Чтение whitelist из листа "Конфигурация" | 5ч | 1.4 |
+| **1.10** | **LLMClient (базовый)** | **Анализ текста БЕЗ чанкинга (фиксированный промпт)** | **8ч** | **1.3, 1.4** |
+| **1.11** | **ContentAnalyzer (упрощенный)** | **Обработка чата БЕЗ голосовых** | **6ч** | **1.7, 1.10** |
+| 1.12 | Sheets запись результатов | append_incidents + append_participant_report | 4ч | 1.9 |
+| **1.13** | **aiogram Bot базовый** | **Инициализация, команды /start, /status** | **5ч** | **1.4, 1.5** |
+| **1.14** | **Notifier (упрощенный)** | **send_incident_alert БЕЗ кнопок** | **4ч** | **1.3, 1.13** |
+| **1.15** | **ScanJob (основной цикл)** | **Оркестрация: Collector → Analyzer → Notifier** | **10ч** | **1.7-1.14** |
+| 1.16 | Scheduler интеграция | APScheduler с запуском каждые 6ч | 3ч | 1.15 |
+| 1.17 | main.py точка входа | Запуск Scheduler + Bot polling параллельно | 3ч | 1.13, 1.16 |
+| **1.18** | **Базовое тестирование MVP** | **Ручное тестирование на 3-5 чатах** | **6ч** | **1.17** |
+| 1.19 | Обработка критических ошибок | FloodWait, API timeout, Sheets fallback | 5ч | 1.15 |
+| 1.20 | Документация MVP | README, .env.example, инструкция по запуску | 3ч | 1.18 |
+
+**Итого Этап 1**: ~96 часов (~12 рабочих дней при 8ч/день)
+
+#### Критерии приемки MVP:
+- ✅ Система собирает сообщения за 6 часов из 5 тестовых чатов
+- ✅ LLM анализирует текст и находит хотя бы 1 тестовый инцидент
+- ✅ Администратор получает уведомление в Telegram
+- ✅ Результаты записываются в Google Sheets
+- ✅ Сверка участников работает корректно
+- ✅ Нет критических ошибок при нормальной работе
+
+---
+
+### ЭТАП 2: Доработка и оптимизация
+
+**Цель**: Доведение до промышленной эксплуатации с полным функционалом
+
+**Сроки**: 8-12 дней  
+**Приоритет**: ВЫСОКИЙ
+
+#### Задачи Этапа 2:
+
+| № | Задача | Описание | Оценка | Зависимости |
+|---|--------|----------|--------|-------------|
+| 2.1 | Whisper интеграция | WhisperClient + download_voice с таймаутом | 6ч | Этап 1 |
+| 2.2 | Голосовые в Analyzer | Интеграция Whisper в ContentAnalyzer.process_chat | 4ч | 2.1 |
+| 2.3 | LLM чанкинг | Реализация chunk_messages + батч-обработка | 5ч | Этап 1 |
+| 2.4 | Улучшение промпта LLM | Добавление примеров, точная JSON-схема | 4ч | Этап 1 |
+| 2.5 | Inline кнопки в алертах | Добавление [Ложное срабатывание] / [Подтвердить] | 5ч | Этап 1 |
+| 2.6 | Callback handlers | Обработка нажатий кнопок + обновление статуса | 6ч | 2.5 |
+| 2.7 | Команда /scan | Принудительный запуск сканирования | 4ч | Этап 1 |
+| 2.8 | Команда /stats | Детальная статистика за период | 5ч | Этап 1 |
+| 2.9 | Сводный отчет | send_summary_report с кнопками | 4ч | Этап 1 |
+| 2.10 | Health check job | Проверка статуса userbot каждые 15 мин | 3ч | Этап 1 |
+| 2.11 | Улучшенная anti-flood защита | Адаптивные задержки на основе FloodWait | 5ч | Этап 1 |
+| 2.12 | Retry механизм | Повторные попытки для API вызовов | 4ч | Этап 1 |
+| 2.13 | Расширенное логирование | Structured logs, metrics для мониторинга | 4ч | Этап 1 |
+| 2.14 | Таблица participants в SQLite | Снапшоты участников для истории | 3ч | Этап 1 |
+| 2.15 | Очистка временных файлов | Автоудаление голосовых после обработки | 2ч | 2.1 |
+| 2.16 | Оптимизация БД | Индексы, VACUUM, архивация старых записей | 4ч | Этап 1 |
+| 2.17 | Масштабирование на 30 чатов | Тестирование на полном объеме | 8ч | 2.1-2.16 |
+| 2.18 | Обработка edge cases | Удаленные сообщения, заблокированные пользователи | 6ч | Этап 1 |
+| 2.19 | Улучшение UI уведомлений | Эмодзи, форматирование, preview ссылок | 3ч | 2.9 |
+| 2.20 | Финальное тестирование | Полный E2E тест на 30 чатах, 24ч работы | 10ч | 2.17 |
+| 2.21 | Production документация | Деплой, мониторинг, troubleshooting | 4ч | 2.20 |
+
+**Итого Этап 2**: ~89 часов (~11 рабочих дней)
+
+#### Критерии приемки Этап 2:
+- ✅ Голосовые транскрибируются корректно (>90% точность для русского)
+- ✅ Система стабильно работает с 30 чатами без пропусков
+- ✅ Интерактивные кнопки функционируют, статусы обновляются
+- ✅ Нет зависаний при скачивании больших голосовых
+- ✅ Логи структурированы, метрики доступны
+- ✅ Система работает непрерывно 24 часа без критических ошибок
+
+---
+
+### ЭТАП 3 (Опционально): Расширенные функции
+
+**Цель**: Дополнительные возможности по запросу клиента
+
+**Приоритет**: НИЗКИЙ
+
+#### Возможные задачи:
+- 3.1. Dashboard на Streamlit для визуализации метрик (16ч)
+- 3.2. Machine Learning модель для детекции инцидентов (вместо LLM) (40ч)
+- 3.3. Интеграция с внешним SIEM (Splunk, ELK) (20ч)
+- 3.4. Мультиязычная поддержка (английский + русский) (12ч)
+- 3.5. Telegram Mini App для управления системой (32ч)
+- 3.6. A/B тестирование разных промптов LLM (8ч)
+- 3.7. Автоматические действия (кик лишних участников) - ВЫСОКИЙ РИСК (16ч)
+
+---
+
+## 6. Тестирование и отладка
+
+### 6.1. План тестирования Этапа 1 (MVP)
+
+#### Модульное тестирование
+
+**1. TelethonCollector**
+```python
+# tests/test_collector.py
+
+import pytest
+from src.collector.client import TelethonCollector
+
+@pytest.mark.asyncio
+async def test_session_initialization():
+    """Проверка инициализации и авторизации"""
+    collector = TelethonCollector(api_id, api_hash, phone)
+    await collector.start_session()
+    assert collector.client.is_connected()
+    await collector.stop_session()
+
+@pytest.mark.asyncio
+async def test_health_check():
+    """Проверка статуса аккаунта"""
+    collector = TelethonCollector(api_id, api_hash, phone)
+    await collector.start_session()
+    is_healthy = await collector.health_check()
+    assert is_healthy is True
+    await collector.stop_session()
+```
+
+**2. MessageHistoryCollector**
+```python
+@pytest.mark.asyncio
+async def test_collect_messages_returns_data():
+    """Проверка сбора сообщений за период"""
+    collector = MessageHistoryCollector(client)
+    messages = await collector.collect_messages(
+        chat_id=-1001234567,
+        hours_back=6
+    )
+    assert len(messages) > 0
+    assert all(isinstance(m, MessageData) for m in messages)
+
+@pytest.mark.asyncio
+async def test_deduplicate_messages():
+    """Проверка дедупликации"""
+    # Запуск сбора дважды
+    messages1 = await collector.collect_messages(chat_id, hours_back=1)
+    messages2 = await collector.collect_messages(chat_id, hours_back=1)
+    
+    # В БД не должно быть дубликатов
+    count = await db.count_messages(chat_id)
+    assert count == len(messages1)
+```
+
+**3. LLMClient**
+```python
+@pytest.mark.asyncio
+async def test_llm_analysis_returns_incidents():
+    """Проверка LLM анализа"""
+    llm_client = LLMClient(api_key, api_url)
+    test_messages = [
+        MessageData(
+            chat_id=-1001234567,
+            message_id=1,
+            text="Наш секретный API ключ: sk-abc123...",
+            timestamp=datetime.now()
+        )
+    ]
+    
+    result = await llm_client.analyze_messages(test_messages, "Test Chat")
+    assert result.summary["incidents_found"] > 0
+    assert any(i.category == IncidentCategory.LEAK for i in result.incidents)
+```
+
+**4. ParticipantCollector**
+```python
+@pytest.mark.asyncio
+async def test_participant_comparison():
+    """Проверка сверки участников"""
+    participants = [
+        ParticipantData(user_id=123, username="user1"),
+        ParticipantData(user_id=456, username="user2"),
+        ParticipantData(user_id=999, username="intruder")  # Лишний
+    ]
+    whitelist = [123, 456, 789]  # 789 отсутствует
+    
+    report = await collector.compare_with_whitelist(
+        chat_id=-1001234567,
+        participants=participants,
+        whitelist=whitelist
+    )
+    
+    assert len(report.missing) == 1
+    assert report.missing[0].user_id == 789
+    assert len(report.extra) == 1
+    assert report.extra[0].user_id == 999
+```
+
+---
+
+#### Интеграционное тестирование
+
+**Сценарий 1: Полный цикл сканирования одного чата**
+```python
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_full_scan_cycle_single_chat():
+    """
+    GIVEN: Тестовый чат с 10 сообщениями и 5 участниками
+    WHEN: Запуск ScanJob.run() для одного чата
+    THEN:
+      - Сообщения собраны и сохранены в SQLite
+      - LLM анализ выполнен
+      - Если есть инциденты - отправлено уведомление
+      - Результаты записаны в Google Sheets
+      - Лог сканирования создан
+    """
+    # Подготовка
+    test_chat_id = -1001234567
+    
+    # Выполнение
+    await scan_job.run_single_chat(test_chat_id)
+    
+    # Проверки
+    messages_in_db = await db.get_messages(test_chat_id)
+    assert len(messages_in_db) == 10
+    
+    incidents_in_db = await db.get_incidents(test_chat_id)
+    # Зависит от контента, но проверяем что запрос работает
+    assert incidents_in_db is not None
+    
+    # Проверка записи в Sheets
+    sheets_data = await sheets.get_incidents()
+    assert any(row["chat_id"] == test_chat_id for row in sheets_data)
+```
+
+**Сценарий 2: Обработка FloodWait**
+```python
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_flood_wait_handling():
+    """
+    GIVEN: Система начинает получать FloodWait от Telegram
+    WHEN: Попытка быстрого сканирования нескольких чатов
+    THEN: Система корректно ждет и продолжает работу
+    """
+    # Имитация быстрого сканирования (без задержек)
+    chat_ids = [-1001234567, -1009876543, -1005555555]
+    
+    results = []
+    for chat_id in chat_ids:
+        try:
+            messages = await collector.collect_messages(chat_id)
+            results.append({"chat_id": chat_id, "status": "success"})
+        except Exception as e:
+            results.append({"chat_id": chat_id, "status": "error", "error": str(e)})
+    
+    # Все чаты должны быть обработаны (возможно с задержками)
+    assert all(r["status"] == "success" for r in results)
+```
+
+---
+
+#### E2E тестирование
+
+**Тест-кейс 1: Утечка информации**
+```gherkin
+Feature: Детекция утечки конфиденциальной информации
+
+Scenario: Пользователь публикует API ключ в чате
+  Given Система мониторит чат "Test Chat"
+  And В чате есть сообщение с текстом "Наш токен: sk-abc123xyz"
+  When Запускается сканирование
+  Then LLM детектирует инцидент категории "leak" с severity "high"
+  And Администратор получает алерт с кнопками действий
+  And Инцидент сохраняется в Google Sheets
+```
+
+**Тест-кейс 2: Лишний участник**
+```gherkin
+Feature: Сверка участников чата с whitelist
+
+Scenario: В чате появился неавторизованный пользователь
+  Given Whitelist для чата содержит [123, 456, 789]
+  And В чате присутствуют пользователи [123, 456, 999]
+  When Запускается сканирование
+  Then Система обнаруживает лишнего участника 999
+  And Администратор получает уведомление о лишнем участнике
+  And Отчет записывается в лист "Участники"
+```
+
+**Тест-кейс 3: Голосовое сообщение с нарушением**
+```gherkin
+Feature: Транскрипция и анализ голосовых сообщений
+
+Scenario: Пользователь отправляет голосовое с неподобающим контентом
+  Given В чате есть голосовое сообщение длительностью 15 секунд
+  And Содержание: "Мой коллега полный идиот"
+  When Запускается сканирование
+  Then Whisper транскрибирует голосовое
+  And LLM детектирует инцидент "inappropriate" с severity "medium"
+  And Администратор получает алерт с транскрипцией
+```
+
+---
+
+### 6.2. Тестовые данные
+
+**Создание тестового окружения**
+```python
+# tests/fixtures/test_data.py
+
+TEST_MESSAGES = [
+    {
+        "text": "Всем привет! Как дела?",
+        "expected_incidents": 0
+    },
+    {
+        "text": "Наш API ключ: sk-proj-abc123xyz",
+        "expected_incidents": 1,
+        "expected_category": "leak",
+        "expected_severity": "high"
+    },
+    {
+        "text": "Купите криптовалюту по ссылке: bit.ly/scam",
+        "expected_incidents": 1,
+        "expected_category": "spam"
+    },
+    {
+        "text": "Ты полный дебил, уволься!",
+        "expected_incidents": 1,
+        "expected_category": "inappropriate",
+        "expected_severity": "high"
+    },
+    {
+        "text": "Кто смотрел вчера футбол?",
+        "expected_incidents": 1,
+        "expected_category": "off_topic",
+        "expected_severity": "low"
+    }
+]
+
+async def populate_test_chat(chat_id: int, client: TelegramClient):
+    """Заполнение тестового чата сообщениями"""
+    for msg_data in TEST_MESSAGES:
+        await client.send_message(chat_id, msg_data["text"])
+        await asyncio.sleep(1)
+```
+
+---
+
+### 6.3. Отладка и мониторинг
+
+**Структурированное логирование**
+```python
+# src/utils/logger.py
+
+from loguru import logger
+import sys
+
+def setup_logger():
+    logger.remove()  # Удаление дефолтного хэндлера
+    
+    # Консоль (для разработки)
+    logger.add(
+        sys.stdout,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        level="INFO"
+    )
+    
+    # Файл (для продакшена)
+    logger.add(
+        "logs/app_{time:YYYY-MM-DD}.log",
+        rotation="00:00",  # Новый файл каждый день
+        retention="30 days",
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} - {message}",
+        serialize=True  # JSON формат
+    )
+    
+    # Файл ошибок
+    logger.add(
+        "logs/errors_{time:YYYY-MM-DD}.log",
+        rotation="10 MB",
+        level="ERROR",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} - {message}",
+        backtrace=True,
+        diagnose=True
+    )
+
+# Использование
+from src.utils.logger import logger
+
+logger.info("Starting scan cycle", extra={"chat_count": 30})
+logger.error("API timeout", extra={"endpoint": "/v1/chat/completions", "timeout": 60})
+```
+
+**Метрики для мониторинга**
+```python
+# src/utils/metrics.py
+
+from dataclasses import dataclass
+from datetime import datetime
+
+@dataclass
+class ScanMetrics:
+    """Метрики одного цикла сканирования"""
+    start_time: datetime
+    end_time: datetime
+    duration_seconds: float
+    chats_processed: int
+    messages_collected: int
+    voices_transcribed: int
+    incidents_found: int
+    errors_count: int
+    api_calls: dict  # {"whisper": 10, "llm": 50}
+    
+    def to_prometheus_format(self) -> str:
+        """Экспорт в Prometheus формат (опционально)"""
+        return f"""
+# HELP telegram_monitor_scan_duration_seconds Duration of scan cycle
+# TYPE telegram_monitor_scan_duration_seconds gauge
+telegram_monitor_scan_duration_seconds {self.duration_seconds}
+
+# HELP telegram_monitor_chats_processed Total chats processed
+# TYPE telegram_monitor_chats_processed counter
+telegram_monitor_chats_processed {self.chats_processed}
+
+# HELP telegram_monitor_incidents_found Incidents found
+# TYPE telegram_monitor_incidents_found counter
+telegram_monitor_incidents_found {self.incidents_found}
+"""
+```
+
+---
+
+### 6.4. Чек-лист перед продакшеном
+
+- [ ] Все тесты проходят (unit + integration + E2E)
+- [ ] Логирование настроено, логи пишутся корректно
+- [ ] .env файл не содержит тестовых данных
+- [ ] .gitignore включает все секреты и сессии
+- [ ] Сессия Telethon создана для технического аккаунта (не личного)
+- [ ] Google Sheets доступ настроен, service account имеет права
+- [ ] APScheduler запускается автоматически
+- [ ] Bot long polling работает стабильно
+- [ ] FloodWait обрабатывается корректно
+- [ ] API timeout не блокирует систему
+- [ ] Временные файлы удаляются после обработки
+- [ ] SQLite база имеет индексы
+- [ ] Sheets не переполняются (есть архивация или ротация)
+- [ ] Уведомления приходят администратору
+- [ ] Кнопки в уведомлениях функционируют
+- [ ] Система работает 24+ часа без критических ошибок
+- [ ] Документация актуальна и понятна
+
+---
+
+## 7. Развертывание и эксплуатация
+
+### 7.1. Требования к серверу
+
+**Минимальные**:
+- CPU: 2 ядра
+- RAM: 4 GB
+- Disk: 20 GB SSD
+- OS: Ubuntu 22.04 LTS
+- Python: 3.11+
+
+**Рекомендуемые (для 30 чатов)**:
+- CPU: 4 ядра
+- RAM: 8 GB
+- Disk: 50 GB SSD
+
+### 7.2. Установка
+
+```bash
+# 1. Клонирование репозитория
+git clone https://github.com/company/telegram-monitor.git
+cd telegram-monitor
+
+# 2. Создание виртуального окружения
+python3.11 -m venv venv
+source venv/bin/activate  # Linux/Mac
+# venv\Scripts\activate  # Windows
+
+# 3. Установка зависимостей
+pip install -r requirements.txt
+
+# 4. Создание структуры папок
+mkdir -p data/sessions data/temp logs
+
+# 5. Настройка .env
+cp config/.env.example config/.env
+nano config/.env  # Заполнение токенов
+
+# 6. Настройка Google Sheets
+# Скачивание service_account.json из Google Cloud Console
+mv ~/Downloads/service_account.json config/
+
+# 7. Первая авторизация Telethon (интерактивно)
+python -c "from src.collector.client import TelethonCollector; import asyncio; asyncio.run(TelethonCollector().start_session())"
+# Ввод кода из Telegram
+
+# 8. Проверка конфигурации
+python -c "from config.settings import settings; print(settings.telethon.api_id)"
+```
+
+### 7.3. Запуск
+
+**Разработка (foreground)**:
+```bash
+python main.py
+```
+
+**Продакшен (systemd service)**:
+```bash
+# Создание systemd unit
+sudo nano /etc/systemd/system/telegram-monitor.service
+```
+
+```ini
+[Unit]
+Description=Telegram Monitor Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/telegram-monitor
+Environment="PATH=/home/ubuntu/telegram-monitor/venv/bin"
+ExecStart=/home/ubuntu/telegram-monitor/venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+# Активация и запуск
+sudo systemctl daemon-reload
+sudo systemctl enable telegram-monitor
+sudo systemctl start telegram-monitor
+
+# Проверка статуса
+sudo systemctl status telegram-monitor
+
+# Логи
+journalctl -u telegram-monitor -f
+```
+
+### 7.4. Мониторинг
+
+**Проверка работоспособности**:
+```bash
+# 1. Проверка процесса
+ps aux | grep "python main.py"
+
+# 2. Проверка логов
+tail -f logs/app_$(date +%Y-%m-%d).log
+
+# 3. Проверка SQLite
+sqlite3 data/local_db.sqlite "SELECT COUNT(*) FROM scan_logs WHERE status='completed' AND DATE(start_time) = DATE('now');"
+
+# 4. Проверка через бота
+# Отправить /status в Telegram боту
+```
+
+**Alerts (опционально)**:
+```python
+# Интеграция с внешней системой мониторинга
+async def send_health_alert():
+    last_scan = await db.get_last_scan_log()
+    if (datetime.now() - last_scan.start_time).total_seconds() > 7 * 3600:
+        # Более 7 часов без сканирования - проблема
+        await notifier.send_message(
+            admin_id,
+            "⚠️ ВНИМАНИЕ: Система не выполняла сканирование более 7 часов!"
+        )
+```
+
+### 7.5. Backup и восстановление
+
+**Backup**:
+```bash
+#!/bin/bash
+# backup.sh
+
+DATE=$(date +%Y%m%d_%H%M%S)
+BACKUP_DIR="/backups/telegram-monitor"
+
+# SQLite
+cp data/local_db.sqlite "$BACKUP_DIR/db_$DATE.sqlite"
+
+# Сессия Telethon
+cp data/sessions/userbot.session "$BACKUP_DIR/session_$DATE.session"
+
+# Конфигурация
+cp config/.env "$BACKUP_DIR/env_$DATE.txt"
+cp config/service_account.json "$BACKUP_DIR/sa_$DATE.json"
+
+# Логи (последние 7 дней)
+tar -czf "$BACKUP_DIR/logs_$DATE.tar.gz" logs/*.log
+
+# Удаление старых бэкапов (> 30 дней)
+find "$BACKUP_DIR" -type f -mtime +30 -delete
+```
+
+**Автоматизация**:
+```bash
+# Добавление в cron (ежедневно в 03:00)
+0 3 * * * /home/ubuntu/telegram-monitor/backup.sh
+```
+
+---
+
+### 7.6. Troubleshooting
+
+| Проблема | Симптомы | Решение |
+|----------|----------|---------|
+| **Userbot не авторизуется** | `SessionPasswordNeededError` | Повторить авторизацию: `python scripts/reauth.py` |
+| **FloodWait постоянно** | Логи полны `FloodWaitError` | Увеличить задержки в config: `FLOOD_DELAY_MIN=30, MAX=60` |
+| **LLM не находит инциденты** | `incidents_found=0` всегда | Проверить промпт, добавить примеры, снизить `temperature` |
+| **Sheets quota exceeded** | `APIError: RATE_LIMIT_EXCEEDED` | Уменьшить частоту записи, использовать батчинг |
+| **Голосовые не скачиваются** | Таймауты на `download_media` | Увеличить `VOICE_DOWNLOAD_TIMEOUT`, проверить скорость сети |
+| **Бот не отвечает** | `/status` не работает | Проверить `BOT_TOKEN`, перезапустить polling |
+| **SQLite заблокирован** | `database is locked` | Добавить `timeout=30` в соединение, использовать WAL mode |
+
+---
+
+## Итоговая оценка проекта
+
+| Метрика | Значение |
+|---------|----------|
+| **Общее время разработки** | 185 часов (~23 дня при 8ч/день) |
+| **MVP готов через** | 12 рабочих дней |
+| **Полный функционал через** | 23 рабочих дня |
+| **Строк кода (оценка)** | ~3500-4000 LOC |
+| **Файлов Python** | ~25-30 |
+| **Тестов (минимум)** | 50+ |
+| **Размер requirements.txt** | 10 библиотек |
+
+---
+
+## Приложение: Примеры кода
+
+### Пример main.py
+
+```python
+# main.py
+
+import asyncio
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from loguru import logger
+
+from config.settings import settings
+from src.collector.client import TelethonCollector
+from src.manager.bot import TelegramBot
+from src.scheduler.jobs import ScanJob
+from src.storage.database import DatabaseManager
+from src.utils.logger import setup_logger
+
+async def main():
+    """Точка входа приложения"""
+    
+    # Настройка логирования
+    setup_logger()
+    logger.info("Starting Telegram Monitor System")
+    
+    # Инициализация БД
+    db_manager = DatabaseManager()
+    await db_manager.init_db()
+    logger.info("Database initialized")
+    
+    # Инициализация Telethon (без запуска)
+    collector = TelethonCollector(
+        api_id=settings.telethon.api_id,
+        api_hash=settings.telethon.api_hash,
+        phone=settings.telethon.phone
+    )
+    logger.info("Telethon collector initialized")
+    
+    # Инициализация Bot
+    bot = TelegramBot(
+        token=settings.aiogram.bot_token,
+        admin_id=settings.aiogram.admin_id
+    )
+    logger.info("Telegram bot initialized")
+    
+    # Инициализация Scheduler
+    scheduler = AsyncIOScheduler()
+    scan_job = ScanJob(collector, bot)
+    
+    # Добавление задач
+    scheduler.add_job(
+        scan_job.run,
+        trigger='interval',
+        hours=settings.app.scan_interval_hours,
+        id='main_scan',
+        replace_existing=True,
+        max_instances=1
+    )
+    logger.info(f"Scan job scheduled every {settings.app.scan_interval_hours} hours")
+    
+    # Запуск компонентов
+    scheduler.start()
+    logger.info("Scheduler started")
+    
+    # Запуск бота (blocking)
+    try:
+        await bot.start_polling()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        scheduler.shutdown()
+        await collector.stop_session()
+        logger.info("Shutdown complete")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+## Заключение
+
+Данный технический план предоставляет полную дорожную карту для реализации гибридной системы мониторинга Telegram с использованием Telethon и aiogram. План включает:
+
+✅ **Детальную архитектуру** с разделением ответственности  
+✅ **Полное описание всех модулей** с примерами кода  
+✅ **Структуры данных** (SQLite схемы, Pydantic модели, Google Sheets)  
+✅ **Поэтапный план разработки** с приоритизацией MVP  
+✅ **Комплексный план тестирования** (unit, integration, E2E)  
+✅ **Инструкции по развертыванию** и эксплуатации  
+
+Система спроектирована с учетом:
+- **Масштабируемости**: 30+ чатов без деградации
+- **Надежности**: Обработка ошибок, retry механизмы, буферизация
+- **Безопасности**: Изоляция userbot, anti-flood, secrets management
+- **Maintainability**: Структурированный код, логирование, документация
+
+**Следующие шаги**: Начать реализацию Этапа 1 (MVP), следуя чек-листу задач из раздела 5.

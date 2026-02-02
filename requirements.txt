@@ -1,0 +1,39 @@
+# Telegram Monitor System - Requirements
+# По спецификации: implementation_hybrid.md (раздел 1.3)
+
+# --- Telegram Core ---
+# Для работы Userbot (сбор данных через MTProto)
+Telethon>=1.34.0
+
+# Для работы официального бота (уведомления и команды)
+aiogram>=3.4.0
+
+# --- Asynchronous & Scheduling ---
+# Планировщик задач (запуск сканирования каждые 6 часов)
+APScheduler>=3.10.4
+
+# Асинхронные HTTP-запросы (для CometAPI: LLM + Whisper)
+aiohttp>=3.9.0
+
+# --- Data & Storage ---
+# Асинхронная работа с Google Sheets
+gspread_asyncio>=1.4.0
+
+# Аутентификация Google Cloud (Service Account)
+google-auth>=2.28.0
+
+# Валидация данных и моделей (MessageData, ParticipantData, etc.)
+pydantic>=2.6.0
+
+# Управление конфигурацией через Pydantic
+pydantic-settings>=2.2.0
+
+# Асинхронный драйвер для SQLite (локальный буфер)
+aiosqlite>=0.20.0
+
+# --- Utilities ---
+# Загрузка переменных окружения из .env
+python-dotenv>=1.0.1
+
+# Продвинутое логирование
+loguru>=0.7.2
