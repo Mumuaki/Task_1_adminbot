@@ -71,3 +71,25 @@ htmlcov/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# ===== PROJECT SPECIFIC =====
+
+# Config secrets (keep .env.example only)
+config/.env
+config/service_account.json
+
+# Telethon sessions
+data/sessions/*.session
+data/sessions/*.session-journal
+
+# Temporary voice files
+data/temp/*.ogg
+data/temp/*.mp3
+data/temp/*.wav
+
+# Logs (keep .gitkeep only)
+logs/*.log
+
+# SQLite database
+data/*.sqlite
+data/*.db
