@@ -1,7 +1,9 @@
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from src.models.data import Incident, GlobalReport
 from src.utils.logger import logger
 from datetime import datetime
+from config.settings import settings
 
 
 # Маппинг эмодзи для категорий инцидентов
@@ -75,10 +77,32 @@ class IncidentNotifier:
             f"📝 <b>Анализ:</b>\n{incident.description}"
         )
         
+        # Создание клавиатуры с кнопками
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Ложное срабатывание",
+                    callback_data=f"incident_false_{incident.id}"
+                ),
+                InlineKeyboardButton(
+                    text="✅ Подтвердить",
+                    callback_data=f"incident_confirm_{incident.id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 Подробнее",
+                    callback_data=f"incident_details_{incident.id}"
+                )
+            ]
+        ])
+        
         try:
             await self.bot.send_message(
                 chat_id=admin_id,
-                text=message_text
+                text=message_text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
             )
             logger.info(f"Incident alert sent to admin {admin_id} for incident {incident.id}")
         except Exception as e:
@@ -129,18 +153,103 @@ class IncidentNotifier:
                 f"   {SEVERITY_EMOJIS['low']} Низкие: {report.low_incidents}\n"
             )
         
+        # Добавление информации об участниках
+        if report.missing_participants > 0 or report.extra_participants > 0:
+            message_text += f"\n👥 <b>Контроль доступа:</b>\n"
+            
+            if report.missing_participants > 0 and hasattr(report, 'missing_ids') and report.missing_ids:
+                message_text += f"   ❌ Отсутствуют ({report.missing_participants}): {', '.join(map(str, report.missing_ids))}\n"
+            elif report.missing_participants > 0:
+                message_text += f"   ❌ Отсутствуют: {report.missing_participants}\n"
+
+            if report.extra_participants > 0 and hasattr(report, 'extra_ids') and report.extra_ids:
+                message_text += f"   🚫 Лишние ({report.extra_participants}): {', '.join(map(str, report.extra_ids))}\n"
+            elif report.extra_participants > 0:
+                message_text += f"   🚫 Лишние: {report.extra_participants}\n"
+        
         # Добавление информации о длительности
         if duration_min > 0:
             message_text += f"\n⏱ Длительность: {duration_min} мин {duration_sec} сек"
         else:
             message_text += f"\n⏱ Длительность: {duration_sec} сек"
+            
+        # Кнопки для сводного отчета
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📊 Открыть таблицу",
+                    url=f"https://docs.google.com/spreadsheets/d/{settings.google_sheets.spreadsheet_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Повторить сканирование",
+                    callback_data="cmd_scan_now"
+                )
+            ]
+        ])
         
         try:
             await self.bot.send_message(
                 chat_id=admin_id,
-                text=message_text
+                text=message_text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
             )
             logger.info(f"Summary report sent to admin {admin_id}")
         except Exception as e:
             logger.error(f"Failed to send summary report to {admin_id}: {e}")
+            raise
+
+    async def edit_incident_card(
+        self,
+        chat_id: int,
+        message_id: int,
+        incident: Incident,
+        new_status: str
+    ):
+        """
+        Редактирование карточки инцидента после принятия решения.
+        
+        Добавляет текстовую метку о принятом решении и удаляет кнопки.
+        
+        Параметры:
+            chat_id: ID чата (admin_id)
+            message_id: ID сообщения для редактирования
+            incident: Объект инцидента
+            new_status: Новый статус ('confirmed', 'false_positive')
+        """
+        # Получение эмодзи для категории и критичности
+        category_emoji = CATEGORY_EMOJIS.get(incident.category.value, "❓")
+        severity_emoji = SEVERITY_EMOJIS.get(incident.severity.value, "⚪")
+        
+        # Метка статуса
+        status_label = "✅ ПОДТВЕРЖДЕНО" if new_status == 'confirmed' else "❌ ЛОЖНОЕ СРАБАТЫВАНИЕ"
+        
+        # Форматирование времени
+        timestamp_str = incident.detected_at.strftime("%d.%m.%Y %H:%M")
+        
+        # Обновленный текст (с меткой решения)
+        message_text = (
+            f"<b>{status_label}</b>\n\n"
+            f"🚨 <b>ИНЦИДЕНТ #{incident.id or 'N/A'}</b>\n\n"
+            f"📍 Чат: <b>{incident.chat_name}</b>\n"
+            f"👤 Пользователь: @{incident.sender_username or 'Unknown'}\n"
+            f"🕐 Время: {timestamp_str}\n\n"
+            f"📂 Категория: {category_emoji} {incident.category.value}\n"
+            f"⚠️ Критичность: {severity_emoji} {incident.severity.value.upper()}\n\n"
+            f"📝 <b>Анализ:</b>\n{incident.description}"
+        )
+        
+        try:
+            await self.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=message_text,
+                reply_markup=None, # Удаляем кнопки
+                parse_mode="HTML"
+            )
+            logger.info(f"Incident card {message_id} updated with status {new_status}")
+        except Exception as e:
+            logger.error(f"Failed to edit incident card {message_id}: {e}")
             raise

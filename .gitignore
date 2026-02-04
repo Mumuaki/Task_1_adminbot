@@ -93,3 +93,11 @@ logs/*.log
 # SQLite database
 data/*.sqlite
 data/*.db
+
+# User Requested Ignores
+logs/
+tests/
+.agent/skills/my-skill/
+REMOVED_LIBRARIES.md
+implementation_hybrid.md
+TZ_hybrid.md

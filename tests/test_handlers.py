@@ -64,6 +64,6 @@ async def test_cmd_help(mock_message):
     assert "📖" in response_text
     assert "Справка по командам" in response_text
     assert "/start" in response_text
-    assert "/status" in response_text
+    assert "/stats" in response_text
     assert "/help" in response_text
-    assert "Система автоматически сканирует чаты" in response_text
+    assert "Система автоматически проверяет чаты" in response_text

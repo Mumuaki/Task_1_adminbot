@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timezone
 from src.core.analyzer import ContentAnalyzer
 from src.core.llm_client import LLMClient
+from src.core.whisper import WhisperClient
 from src.models.data import (
     MessageData, 
     AnalysisResult, 
@@ -21,9 +22,15 @@ def mock_llm_client():
 
 
 @pytest.fixture
-def content_analyzer(mock_llm_client):
+def mock_whisper_client():
+    """Фикстура для мокированного WhisperClient"""
+    return MagicMock(spec=WhisperClient)
+
+
+@pytest.fixture
+def content_analyzer(mock_llm_client, mock_whisper_client):
     """Фикстура для ContentAnalyzer"""
-    return ContentAnalyzer(llm_client=mock_llm_client)
+    return ContentAnalyzer(llm_client=mock_llm_client, whisper_client=mock_whisper_client)
 
 
 @pytest.fixture
@@ -213,7 +220,7 @@ async def test_process_chat_with_voice_transcription(content_analyzer, mock_llm_
 async def test_aggregate_results_empty():
     """Тест агрегации пустого списка результатов"""
     
-    analyzer = ContentAnalyzer(llm_client=MagicMock())
+    analyzer = ContentAnalyzer(llm_client=MagicMock(), whisper_client=MagicMock())
     
     start_time = datetime.now(timezone.utc)
     end_time = datetime.now(timezone.utc)
@@ -239,7 +246,7 @@ async def test_aggregate_results_empty():
 async def test_aggregate_results_success():
     """Тест успешной агрегации результатов"""
     
-    analyzer = ContentAnalyzer(llm_client=MagicMock())
+    analyzer = ContentAnalyzer(llm_client=MagicMock(), whisper_client=MagicMock())
     
     # Создаём несколько результатов чатов
     chat_results = [

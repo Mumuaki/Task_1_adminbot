@@ -1,4 +1,5 @@
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from datetime import datetime, timedelta, timezone
 from typing import List
 import asyncio
@@ -64,6 +65,15 @@ class MessageHistoryCollector:
                 
                 collected_messages.append(msg_data)
                 
+                # Добавляем микро-паузу для предотвращения FloodWait при больших объемах
+                await asyncio.sleep(0.1)
+
+                
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait for {e.seconds} seconds in {chat_id}")
+            await asyncio.sleep(e.seconds)
+            # Re-try once after wait (optional, here we just return what we have so far)
+            return collected_messages
         except Exception as e:
             logger.error(f"Error collecting messages from {chat_id}: {e}")
             raise e
@@ -114,6 +124,10 @@ class MessageHistoryCollector:
                 return Path(saved_path)
             return None
             
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait during download: waiting {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+            return None
         except asyncio.TimeoutError:
             logger.warning(f"Timeout downloading voice message {message.id}")
             return None

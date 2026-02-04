@@ -25,8 +25,7 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(test_db_path.exists(), "DB file was not created")
             
             # Проверим таблицы
-            conn = await db.get_connection()
-            try:
+            async with db.get_connection() as conn:
                 cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
                 rows = await cursor.fetchall()
                 # rows - это объекты Row, приводим к строкам или обращаемся по ключу
@@ -35,9 +34,6 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
                 required_tables = ['messages', 'incidents', 'participants', 'scan_logs']
                 for table in required_tables:
                     self.assertIn(table, tables, f"Table {table} missing")
-                    
-            finally:
-                await conn.close()
                 
         finally:
             # Cleanup

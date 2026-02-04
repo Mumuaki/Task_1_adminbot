@@ -1,4 +1,5 @@
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from typing import List, Set
 from src.utils.logger import logger
 from src.models.data import ParticipantData, ParticipantReport
@@ -39,6 +40,10 @@ class ParticipantCollector:
                 )
                 participants_data.append(p_data)
                 
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait during participants collection: waiting {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+            return participants_data
         except Exception as e:
             logger.error(f"Error collecting participants from {chat_id}: {e}")
             raise e

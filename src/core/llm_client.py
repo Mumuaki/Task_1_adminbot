@@ -1,4 +1,5 @@
 import aiohttp
+import asyncio
 from typing import List
 from src.utils.logger import logger
 from src.models.data import MessageData, Incident, AnalysisResult, IncidentCategory, Severity
@@ -20,7 +21,7 @@ class LLMClient:
         self,
         api_key: str,
         api_url: str,
-        model: str = "gpt-4-turbo",
+        model: str = "gpt-3.5-turbo",
         temperature: float = 0.3
     ):
         self.api_key = api_key
@@ -154,11 +155,30 @@ class LLMClient:
         
         logger.info(f"Sending {len(messages)} messages to LLM for analysis")
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
-                    response.raise_for_status()
-                    data = await response.json()
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url, 
+                        headers=headers, 
+                        json=payload, 
+                        timeout=aiohttp.ClientTimeout(total=60)
+                    ) as response:
+                        if response.status == 429:  # Rate limit
+                            if attempt == max_retries - 1:
+                                logger.error(f"LLM API rate limit exceeded after {max_retries} attempts.")
+                                response.raise_for_status() # Raise existing 429 error
+                            
+                            wait_time = int(response.headers.get("Retry-After", retry_delay))
+                            logger.warning(f"LLM API rate limited. Waiting {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                            
+                        response.raise_for_status()
+                        data = await response.json()
                     
                     # Извлечение контента
                     content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
@@ -177,10 +197,10 @@ class LLMClient:
                         try:
                             incident = Incident(
                                 message_id=inc_data["message_id"],
-                                chat_id=messages[0].chat_id,  # Берём из первого сообщения
+                                chat_id=messages[0].chat_id,
                                 chat_name=chat_name,
-                                sender_id=None,  # Будет заполнено в ContentAnalyzer
-                                sender_username=None,  # Будет заполнено в ContentAnalyzer
+                                sender_id=None,
+                                sender_username=None,
                                 category=IncidentCategory(inc_data["category"]),
                                 severity=Severity(inc_data["severity"]),
                                 description=inc_data["description"],
@@ -202,12 +222,16 @@ class LLMClient:
                     logger.info(f"Analysis complete: {len(incidents)} incidents found")
                     return analysis_result
                     
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP error calling LLM API: {e}")
-            raise
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse LLM response: {e}")
-            raise ValueError(f"Invalid JSON response from LLM: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error in LLM analysis: {e}")
-            raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"LLM API call failed after {max_retries} attempts: {e}")
+                    raise
+                wait = retry_delay * (2 ** attempt)
+                logger.warning(f"LLM API attempt {attempt+1} failed: {e}. Retrying in {wait}s...")
+                await asyncio.sleep(wait)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse LLM response: {e}")
+                raise ValueError(f"Invalid JSON response from LLM: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error in LLM analysis: {e}")
+                raise

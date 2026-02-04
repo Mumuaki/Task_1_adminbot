@@ -58,9 +58,9 @@ class TestHistory(unittest.IsolatedAsyncioTestCase):
             yield msg3
 
         # side_effect works for calling the method, but here iter_messages is called and returns an async iterator
-        # AsyncMock called returns a Coroutine by default, but we nneed it to return an Async Iterator
-        # Setting side_effect on the call to return our generator works.
-        mock_client.iter_messages.side_effect = mock_iter_messages
+        # We use a regular MagicMock instead of AsyncMock for this specific method 
+        # because AsyncMock always returns a coroutine when called.
+        mock_client.iter_messages = MagicMock(side_effect=mock_iter_messages)
         
         collector = MessageHistoryCollector(mock_client)
         messages = await collector.collect_messages(chat_id=-100123, hours_back=6)

@@ -49,6 +49,7 @@ class AppSettings(BaseSettings):
     voice_max_size_mb: int = 50
     flood_delay_min: int = 10
     flood_delay_max: int = 30
+    monitored_chats: list[int] = []  # List of chat IDs to monitor
     
     model_config = SettingsConfigDict(env_prefix="APP_")
 

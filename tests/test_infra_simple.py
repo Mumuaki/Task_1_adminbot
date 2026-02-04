@@ -4,35 +4,38 @@ import unittest
 from pathlib import Path
 import logging
 
-# Устанавливаем минимально необходимые переменные окружения
-# чтобы Pydantic не ругался при импорте settings
-os.environ["TG_API_ID"] = "12345"
-os.environ["TG_API_HASH"] = "test_hash_0000000000000000000000000"
-os.environ["TG_PHONE"] = "+79991234567"
-os.environ["BOT_TOKEN"] = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-os.environ["BOT_ADMIN_ID"] = "999999999"
-os.environ["COMET_API_KEY"] = "sk-test-key-1234567890abcdef"
-os.environ["GOOGLE_SPREADSHEET_ID"] = "1A2B3C4D5E6F7G8H9I0J1K2L3M4N5O6P"
-
 # Добавляем корень проекта в путь
 project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 class TestInfrastructure(unittest.TestCase):
+    def setUp(self):
+        # Подготовка тестового окружения через patch.dict
+        self.env_patcher = unittest.mock.patch.dict(os.environ, {
+            "TG_API_ID": "1234567",
+            "TG_API_HASH": "test_hash_0000000000000000000000000",
+            "TG_PHONE": "+79991234567",
+            "BOT_TOKEN": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            "BOT_ADMIN_ID": "999999999",
+            "COMET_API_KEY": "sk-test-key-1234567890abcdef",
+            "GOOGLE_SPREADSHEET_ID": "1A2B3C4D5E6F7G8H9I0J1K2L3M4N5O6P"
+        })
+        self.env_patcher.start()
+
+    def tearDown(self):
+        self.env_patcher.stop()
+
     def test_settings_load(self):
         """Проверка загрузки настроек"""
         from config import settings
         from config.settings import Settings
         
-        # Если импорт прошел и settings создался (может потребоваться пересоздать если глобальный failed)
-        if settings.settings is None:
-             # Попробуем создать вручную, так как ENV мы задали выше
-            cfg = Settings()
-        else:
-            cfg = settings.settings
+        # Всегда создаем новый экземпляр настроек для теста, 
+        # чтобы гарантированно прочитать значения из os.environ
+        cfg = Settings()
 
         self.assertIsNotNone(cfg)
-        self.assertEqual(cfg.telethon.api_id, 12345)
+        self.assertEqual(cfg.telethon.api_id, 1234567)
         self.assertEqual(cfg.telethon.api_hash, "test_hash_0000000000000000000000000")
         self.assertEqual(cfg.app.scan_interval_hours, 6) # Default value checking
 

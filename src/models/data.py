@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from datetime import datetime
 from typing import Optional, List
 from enum import Enum
@@ -38,8 +38,8 @@ class MessageData(BaseModel):
     voice_transcription: Optional[str] = None
     timestamp: datetime
     
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "chat_id": -1001234567890,
                 "message_id": 12345,
@@ -50,6 +50,7 @@ class MessageData(BaseModel):
                 "timestamp": "2026-02-02T15:30:00"
             }
         }
+    )
 
 class TranscriptionResult(BaseModel):
     """Результат транскрипции голосового"""
@@ -117,6 +118,8 @@ class ChatAnalysisResult(BaseModel):
     voices_transcribed: int
     incidents: List[Incident]
     processing_time: float
+    participant_report: Optional[ParticipantReport] = None
+
     
 class GlobalReport(BaseModel):
     """Сводный отчет по всем чатам"""
@@ -134,6 +137,8 @@ class GlobalReport(BaseModel):
     missing_participants: int
     extra_participants: int
     duration_seconds: float
+    missing_ids: List[int] = []
+    extra_ids: List[int] = []
     
     def to_scan_log(self) -> dict:
         """Преобразование в формат для scan_logs таблицы"""
