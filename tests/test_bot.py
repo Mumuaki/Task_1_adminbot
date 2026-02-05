@@ -33,6 +33,9 @@ async def test_start_polling_error_handling(bot_token, admin_id):
     with patch('src.manager.bot.router', Router()):
         bot_instance = TelegramBot(token=bot_token, admin_id=admin_id)
         
+        # Мокируем bot.delete_webhook чтобы не было реальных запросов
+        bot_instance.bot.delete_webhook = AsyncMock()
+        
         # Мокируем dp.start_polling чтобы вызвать исключение
         bot_instance.dp.start_polling = AsyncMock(side_effect=Exception("Test error"))
         

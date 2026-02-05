@@ -35,7 +35,10 @@ async def test_cmd_status(mock_message):
     """Тест команды /status"""
     # Мокируем settings
     with patch('src.manager.handlers.settings') as mock_settings:
-        mock_settings.app_scan_interval_hours = 6
+        # Устанавливаем admin_id равным ID пользователя в тесте
+        mock_settings.aiogram.admin_id = 123456789
+        mock_settings.app.monitored_chats = [1, 2, 3]  # Пример чатов
+        mock_settings.app.scan_interval_hours = 6
         
         await cmd_status(mock_message)
     
